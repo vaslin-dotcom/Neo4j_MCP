@@ -3,6 +3,11 @@ import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 load_dotenv()
+
+uri=os.getenv("NEO4J_URI")
+user_name=os.getenv("NEO4J_USERNAME")
+password=os.getenv("NEO4J_PASSWORD")
+
 def groq_llm(tools=None):
     key = os.getenv("GROQ_API_KEY")
     url = "https://api.groq.com/openai/v1"

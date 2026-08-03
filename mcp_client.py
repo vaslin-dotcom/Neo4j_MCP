@@ -1,7 +1,7 @@
 import asyncio
 from mcp.client.stdio import stdio_client
 from mcp import ClientSession,StdioServerParameters
-from config import groq_llm
+from config import groq_llm,uri,user_name,password
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 
@@ -24,7 +24,12 @@ async def run_agent_loop(llm,session,messages):
 async def main():
     server_parameters = StdioServerParameters(
         command='python',
-        args=['mcp_server.py']
+        args=['mcp_server.server.py'],
+        env={
+            "NEO4J_URI": uri,
+            "NEO4J_USERNAME": user_name,
+            "NEO4J_PASSWORD": password,
+        }
     )
 
     async with stdio_client(server_parameters) as (read, write):
@@ -38,7 +43,7 @@ async def main():
 
             messages=[
                 SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),
-                HumanMessage(content=f"summarise the following document\n{file}"),
+                HumanMessage(content=f"Check if you can connect to the Neo4j database."),
             ]
             summary_response=await run_agent_loop(llm,session,messages)
 
