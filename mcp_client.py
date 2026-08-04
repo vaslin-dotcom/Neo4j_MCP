@@ -1,7 +1,7 @@
 import asyncio
 from mcp.client.stdio import stdio_client
 from mcp import ClientSession,StdioServerParameters
-from config import groq_llm,uri,user_name,password
+from config import get_llm,uri,user_name,password
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp.types import CreateMessageResult,TextContent
@@ -28,7 +28,7 @@ async def sampling_callback(context, params):
     hand the result back."""
     prompt_text = params.messages[0].content.text
 
-    llm = groq_llm()  # no tools bound - this is a plain completion, not a tool-calling turn
+    llm = get_llm()  # no tools bound - this is a plain completion, not a tool-calling turn
     response = llm.invoke(prompt_text)
 
     return CreateMessageResult(
@@ -54,9 +54,9 @@ async def main():
             await session.initialize()
 
             tools=await load_mcp_tools(session)
-            llm=groq_llm(tools=tools)
+            llm = get_llm().bind_tools(tools)
 
-            file=r"D:\manual\1. EMD Dicer User - Manual_compressed.pdf"
+            file=r"D:\data\Game+of+Thrones.pdf"
 
             messages=[
                 SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),
