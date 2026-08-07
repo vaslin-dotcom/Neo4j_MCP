@@ -1,45 +1,38 @@
-import asyncio
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.types import CreateMessageResult, TextContent
-from config import groq_llm, uri, user_name, password
+import os, time
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from mcp_server.schemas import ExtractionResult  # your real schema
 
+load_dotenv()
 
-async def sampling_callback(context, params):
-    prompt_text = params.messages[0].content.text
-    llm = groq_llm()
-    response = llm.invoke(prompt_text)
-    return CreateMessageResult(
-        role="assistant",
-        content=TextContent(type="text", text=response.content),
-        model="llama-3.3-70b-versatile",
-    )
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
 
+llm = ChatOpenAI(
+    model=MODEL,
+    temperature=0,
+    api_key=NVIDIA_API_KEY,
+    base_url=NVIDIA_BASE_URL,
+    max_retries=0,
+    request_timeout=90,   # generous, matching your working test
+    max_tokens=3000,      # matching your real extraction call
+)
 
-async def main():
-    server_parameters = StdioServerParameters(
-        command='python',
-        args=['mcp_server/server.py'],
-        env={
-            "NEO4J_URI": uri,
-            "NEO4J_USERNAME": user_name,
-            "NEO4J_PASSWORD": password,
-        }
-    )
+structured_llm = llm.with_structured_output(ExtractionResult)
 
-    async with stdio_client(server_parameters) as (read, write):
-        async with ClientSession(
-            read, write, sampling_callback=sampling_callback
-        ) as session:
-            await session.initialize()
+sample_chunk = "Saad Khan serves as Committee Director. He is a student at the University of Toronto majoring in Human Biology and Chemistry." * 5  # something chunk-sized
 
-            file_path = r"D:\manual\1. EMD Dicer User - Manual_compressed.pdf"
+prompt = f"Extract entities and relationships from this text:\n{sample_chunk}"
 
-            result = await session.call_tool("extract_entities", {"file_path": file_path})
-
-            print("--- Raw Result ---")
-            print(result.content[0].text)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+start = time.time()
+try:
+    result = structured_llm.invoke(prompt)
+    print(f"SUCCESS in {time.time()-start:.2f}s")
+    print(result)
+except Exception as e:
+    print(f"FAILED after {time.time()-start:.2f}s")
+    print(f"Error type: {type(e).__name__}")
+    print(f"Error message: {e}")
+    print(f"Cause: {e.__cause__}")
+    import traceback; traceback.print_exc()
