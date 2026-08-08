@@ -21,7 +21,7 @@ user_name = os.getenv("NEO4J_USERNAME")
 password = os.getenv("NEO4J_PASSWORD")
 
 
-def _build_llm(model: str, api_key: str, base_url: str, max_tokens: int = 6000, disable_thinking: bool = False):
+def _build_llm(model: str, api_key: str, base_url: str, max_tokens: int = 8000, disable_thinking: bool = False):
     kwargs = dict(
         model=model,
         temperature=0,

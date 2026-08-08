@@ -116,14 +116,14 @@ class Neo4jSetup:
     @staticmethod
     def _merge_relationships(tx, rel_type: str, rels: list[dict]):
         # rel_type is sanitized (alnum/underscore only) before reaching here — safe to interpolate.
-        # MERGE (not MATCH) on both endpoints: if a relationship references an
-        # entity the extraction step never produced, create it with its stated
-        # type instead of silently dropping the relationship.
+        # MERGE on both endpoints (dedup entities), but CREATE for the relationship
+        # itself — duplicate relationships between the same two entities are
+        # allowed, per design (entities must be unique, relationships need not be).
         query = f"""
             UNWIND $rels AS r
             MERGE (a:Entity {{name: r.source_name, type: r.source_type}})
             MERGE (b:Entity {{name: r.target_name, type: r.target_type}})
-            MERGE (a)-[rel:`{rel_type}`]->(b)
+            CREATE (a)-[rel:`{rel_type}`]->(b)
         """
         tx.run(query, rels=rels)
 

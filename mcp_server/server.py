@@ -11,8 +11,16 @@ neo4j_instance = Neo4jSetup()
 
 EXTRACTION_TOOL_NAME = "return_extraction"
 
+
 @mcp.tool()
-async def extract_entities(file_path: str, ctx: Context) -> str:
+async def extract_and_store_entities(file_path: str, ctx: Context) -> str:
+    """Extract named entities and relationships from a PDF/DOCX file and
+    write them into Neo4j.
+
+    The file is split into chunks, each chunk is processed through the
+    connected client's LLM (via MCP sampling), and the combined results
+    are written into the graph database once extraction is complete.
+    """
     all_entities: list[Entity] = []
     all_relationships: list[Relationship] = []
     failed_chunks = 0
@@ -30,7 +38,7 @@ async def extract_entities(file_path: str, ctx: Context) -> str:
         try:
             result = await ctx.session.create_message(
                 messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                max_tokens=3000,
+                max_tokens=8000,
                 tools=[extraction_tool],
                 tool_choice=ToolChoice(mode="required"),
             )
@@ -50,7 +58,6 @@ async def extract_entities(file_path: str, ctx: Context) -> str:
                         print(f"[chunk {i}] parse failed: {parse_err}", file=sys.stderr)
                         continue
                 elif block.type == "tool_use":
-                    # kept for safety in case a future sampling_callback returns native tool_use
                     extraction = ExtractionResult.model_validate(block.input)
                     all_entities.extend(extraction.entities)
                     all_relationships.extend(extraction.relationships)
@@ -59,16 +66,25 @@ async def extract_entities(file_path: str, ctx: Context) -> str:
             print(f"[chunk {i}] failed: {e}", file=sys.stderr)
             continue
 
-    # build result AFTER the loop, once, over all chunks
-    output = {
-        "entities": [e.model_dump() for e in all_entities],
-        "relationships": [r.model_dump() for r in all_relationships],
-    }
-    if failed_chunks > 0:
-        output["warning"] = f"{failed_chunks} of {total_chunks} chunks failed to extract - results may be incomplete."
+    # Nothing extracted at all - don't bother calling Neo4j
     if total_chunks > 0 and failed_chunks == total_chunks:
         return json.dumps({"error": f"All {total_chunks} chunks failed extraction. Check server logs for details."})
 
+    # Convert Pydantic objects -> plain dicts, exactly the shape write_graph expects
+    entities_payload = [e.model_dump() for e in all_entities]
+    relationships_payload = [r.model_dump() for r in all_relationships]
+
+    write_stats = neo4j_instance.write_graph(entities_payload, relationships_payload)
+
+    output = {
+        "entities_extracted": len(entities_payload),
+        "relationships_extracted": len(relationships_payload),
+        **write_stats,
+    }
+    if failed_chunks > 0:
+        output["warning"] = f"{failed_chunks} of {total_chunks} chunks failed to extract - results may be incomplete."
+
+    return json.dumps(output)
     return json.dumps(output)
 @mcp.tool()
 def setup_neo4j_connection() -> str:
