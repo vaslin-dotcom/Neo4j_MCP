@@ -7,18 +7,21 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp.types import CreateMessageResult,TextContent,SamplingCapability, SamplingToolsCapability
 
-async def run_agent_loop(llm,session,messages):
+async def run_agent_loop(llm, session, messages, max_tool_calls=15):
+    tool_call_count = 0
     for loop in range(10):
         ai_response = llm.invoke(messages)
         messages.append(ai_response)
         if not ai_response.tool_calls:
             return ai_response.content
 
-        else:
-            for call in ai_response.tool_calls:
-                tool_result = await session.call_tool(call['name'], call['args'])
-                tool_output = tool_result.content[0].text
-                messages.append(ToolMessage(content=tool_output, tool_call_id=call['id']))
+        for call in ai_response.tool_calls:
+            if tool_call_count >= max_tool_calls:
+                return "I wasn't able to find a confident answer after several attempts."
+            tool_call_count += 1
+            tool_result = await session.call_tool(call['name'], call['args'])
+            tool_output = tool_result.content[0].text
+            messages.append(ToolMessage(content=tool_output, tool_call_id=call['id']))
 
     return "stopped tool calling"
 
@@ -66,8 +69,8 @@ async def main():
             file=r"D:\data\GOT.pdf"
 
             messages=[
-                SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),
-                HumanMessage(content=f"What are the entities and relationships in {file}"),
+                SystemMessage(content="You are a helpful assistant who has access to graph db."),
+                HumanMessage(content="to whom is Olenna Redwyne the mother of"),
             ]
             summary_response=await run_agent_loop(llm,session,messages)
 

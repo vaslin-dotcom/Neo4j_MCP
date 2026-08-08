@@ -85,12 +85,29 @@ async def extract_and_store_entities(file_path: str, ctx: Context) -> str:
         output["warning"] = f"{failed_chunks} of {total_chunks} chunks failed to extract - results may be incomplete."
 
     return json.dumps(output)
-    return json.dumps(output)
+
+@mcp.tool()
+def get_entity_context(entity_query: str, relation_query: str = None) -> str:
+    """Look up an entity in the graph and return its connections.
+
+    Uses semantic (embedding-based) matching, so exact spelling isn't
+    required - e.g. "curie" will match "Marie Curie".
+
+    Args:
+        entity_query: The entity to look up, as mentioned in the user's question.
+        relation_query: Optional - a relationship word/phrase from the question
+            (e.g. "married", "works with"). Matched semantically against
+            relationship types actually stored in the graph, so exact
+            wording isn't required.
+    """
+    result = neo4j_instance.get_entity_context(entity_query, relation_query)
+    return json.dumps(result)
+
 @mcp.tool()
 def setup_neo4j_connection() -> str:
-    """Verify that a connection to Neo4j can be established using the configured credentials."""
     try:
         neo4j_instance.connect()
+        neo4j_instance.setup_constraints()
         return "Connected to Neo4j successfully. Ready to proceed."
     except Exception as e:
         return f"Could not connect to Neo4j: {e}"
