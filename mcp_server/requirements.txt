@@ -1,0 +1,13 @@
+mcp
+langchain-mcp-adapters
+langchain-openai
+langchain-core
+langchain-text-splitters
+openai
+pydantic
+neo4j
+sentence-transformers
+pypdf
+python-docx
+openpyxl
+python-dotenv
