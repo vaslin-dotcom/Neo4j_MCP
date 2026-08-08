@@ -1,3 +1,4 @@
+import csv
 import os
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
@@ -10,6 +11,14 @@ import sys
 def normalize_name(name: str) -> str:
     """Collapse whitespace and standardize casing so near-duplicate names merge into one node."""
     return re.sub(r'\s+', ' ', name.strip()).title()
+
+from sentence_transformers import SentenceTransformer
+
+_embedder = SentenceTransformer("all-MiniLM-L6-v2")  # loaded once at module import
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batch-embed a list of strings locally - no API calls, no rate limits."""
+    return _embedder.encode(texts).tolist()
 
 
 def sanitize_relation_type(relation: str) -> str:
@@ -27,35 +36,33 @@ class Neo4jSetup:
         self.driver = None
 
     def connect(self):
-        """Create the driver and verify the connection actually works."""
         self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
         try:
             self.driver.verify_connectivity()
-            print("Neo4j connection successful.")
+            print("Neo4j connection successful.", file=sys.stderr)
         except Exception as e:
-            print(f"Neo4j connection failed: {e}")
+            print(f"Neo4j connection failed: {e}", file=sys.stderr)
             raise
 
     def setup_constraints(self):
-        """
-        Ensure Entity (name, type) combinations are unique - this is what makes
-        MERGE work correctly for exact-match deduplication (v1 approach,
-        no embedding similarity yet). Using the composite key instead of
-        name alone so "Apple" (Organization) and "Apple" (Concept) are
-        correctly treated as distinct nodes.
-        """
         with self.driver.session() as session:
             session.run("""
                 CREATE CONSTRAINT entity_name_type_unique IF NOT EXISTS
                 FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE
             """)
-        print("Entity (name, type) uniqueness constraint ensured.")
+            session.run("""
+                CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS
+                FOR (e:Entity) ON e.embedding
+                OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}}
+            """)
+            session.run("""
+                CREATE VECTOR INDEX relation_type_embeddings IF NOT EXISTS
+                FOR (rt:RelationType) ON rt.embedding
+                OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}}
+            """)
+        print("Constraints and vector indexes ensured.", file=sys.stderr)
 
     def write_graph(self, entities: list[dict], relationships: list[dict]) -> dict:
-        """
-        entities: [{"name":..., "type":..., "description":...}, ...]
-        relationships: [{"source": {name,type,description}, "relation":..., "target": {name,type,description}}, ...]
-        """
         if self.driver is None:
             self.connect()
 
@@ -63,6 +70,13 @@ class Neo4jSetup:
             {**e, "name": normalize_name(e["name"])}
             for e in entities
         ]
+
+        # NEW: embed all entity names in ONE batch call
+        if norm_entities:
+            names = [e["name"] for e in norm_entities]
+            embeddings = embed_texts(names)
+            for e, emb in zip(norm_entities, embeddings):
+                e["embedding"] = emb
 
         norm_relationships = []
         for r in relationships:
@@ -88,6 +102,15 @@ class Neo4jSetup:
                 rel_type = sanitize_relation_type(rel["relation"])
                 by_type.setdefault(rel_type, []).append(rel)
 
+            # NEW: embed all distinct relation types in ONE batch call
+            if by_type:
+                rel_type_names = list(by_type.keys())
+                rel_type_embeddings = embed_texts(rel_type_names)
+                session.execute_write(
+                    self._merge_relation_types,
+                    list(zip(rel_type_names, rel_type_embeddings))
+                )
+
             for rel_type, rels in by_type.items():
                 try:
                     session.execute_write(self._merge_relationships, rel_type, rels)
@@ -108,10 +131,19 @@ class Neo4jSetup:
             """
             UNWIND $entities AS e
             MERGE (n:Entity {name: e.name, type: e.type})
-            SET n.description = coalesce(e.description, n.description, '')
+            SET n.description = coalesce(e.description, n.description, ''),
+                n.embedding = e.embedding
             """,
             entities=entities,
         )
+
+    @staticmethod
+    def _merge_relation_types(tx, type_embeddings: list[tuple]):
+        tx.run("""
+            UNWIND $items AS item
+            MERGE (rt:RelationType {name: item[0]})
+            ON CREATE SET rt.embedding = item[1]
+            """, items=[list(t) for t in type_embeddings])
 
     @staticmethod
     def _merge_relationships(tx, rel_type: str, rels: list[dict]):
@@ -127,25 +159,87 @@ class Neo4jSetup:
         """
         tx.run(query, rels=rels)
 
+    def get_entity_context(self, entity_query: str, relation_query: str = None, limit: int = 20) -> dict:
+        if self.driver is None:
+            self.connect()
+
+        entity_embedding = embed_texts([entity_query])[0]
+
+        with self.driver.session() as session:
+            # Step 1: vector search to resolve the fuzzy entity query to a real node
+            match = session.run("""
+                CALL db.index.vector.queryNodes('entity_embeddings', 1, $embedding)
+                YIELD node, score
+                RETURN node.name AS name, node.type AS type,
+                       node.description AS description, score
+            """, embedding=entity_embedding).single()
+            print(f"[get_entity_context] query={entity_query!r} match={match}", file=sys.stderr)
+            if match is None or match["score"] < 0.3:
+                return {"found": False, "query": entity_query}
+
+            resolved_name = match["name"]
+            resolved_type = match["type"]
+
+            # Step 2: if a relation was given, resolve it too via vector search
+            relation_filter = None
+            if relation_query:
+                rel_embedding = embed_texts([relation_query])[0]
+                rel_match = session.run("""
+                    CALL db.index.vector.queryNodes('relation_type_embeddings', 1, $embedding)
+                    YIELD node, score
+                    RETURN node.name AS name, score
+                """, embedding=rel_embedding).single()
+                if rel_match and rel_match["score"] >= 0.3:
+                    relation_filter = rel_match["name"]
+
+            # Step 3: fetch connections, filtered by resolved relation if one was found
+            if relation_filter:
+                conn_result = session.run(f"""
+                    MATCH (e:Entity {{name: $name, type: $type}})-[r:`{relation_filter}`]-(other:Entity)
+                    RETURN type(r) AS relation, other.name AS connected_name,
+                           other.type AS connected_type, other.description AS connected_description
+                    LIMIT $limit
+                """, name=resolved_name, type=resolved_type, limit=limit)
+            else:
+                conn_result = session.run("""
+                    MATCH (e:Entity {name: $name, type: $type})-[r]-(other:Entity)
+                    RETURN type(r) AS relation, other.name AS connected_name,
+                           other.type AS connected_type, other.description AS connected_description
+                    LIMIT $limit
+                """, name=resolved_name, type=resolved_type, limit=limit)
+
+            connections = [dict(r) for r in conn_result]
+
+        return {
+            "found": True,
+            "entity_name": resolved_name,
+            "entity_type": resolved_type,
+            "entity_description": match["description"],
+            "resolved_relation": relation_filter,
+            "connections": connections,
+        }
+
 
 from typing import Iterator
 from pypdf import PdfReader
 from docx import Document
 from pathlib import Path
+from openpyxl import load_workbook
 
 
 
 def stream_pages(file_path: str) -> Iterator[str]:
-    """Yield text page-by-page (PDF) or paragraph-block-by-block (DOCX)
-    instead of loading the whole document into one string."""
+    """Yield text page-by-page (PDF), paragraph-block-by-block (DOCX), or
+    row-block-by-block (XLSX) instead of loading the whole document into
+    one string."""
     path = Path(file_path)
     if path.suffix == ".pdf":
         reader = PdfReader(str(path))
         for page in reader.pages:
             yield page.extract_text() or ""
+
     elif path.suffix == ".docx":
         document = Document(str(path))
-        # batch paragraphs to approximate "page-sized" units
         buf = []
         for p in document.paragraphs:
             buf.append(p.text)
@@ -154,6 +248,53 @@ def stream_pages(file_path: str) -> Iterator[str]:
                 buf = []
         if buf:
             yield "\n".join(buf)
+
+    elif path.suffix in (".xlsx", ".xlsm"):
+        workbook = load_workbook(str(path), read_only=True, data_only=True)
+        for sheet in workbook.worksheets:
+            rows_iter = sheet.iter_rows(values_only=True)
+            try:
+                headers = next(rows_iter)
+            except StopIteration:
+                continue  # empty sheet
+
+            headers = [str(h) if h is not None else f"col{i}" for i, h in enumerate(headers)]
+            buf = [f"Sheet: {sheet.title}"]
+
+            for row in rows_iter:
+                if row is None or all(v is None for v in row):
+                    continue
+                row_text = ", ".join(
+                    f"{h}: {v}" for h, v in zip(headers, row) if v is not None
+                )
+                buf.append(row_text)
+                if len("\n".join(buf)) > 2000:
+                    yield "\n".join(buf)
+                    buf = [f"Sheet: {sheet.title} (continued)"]
+
+            if len(buf) > 1:  # more than just the header line
+                yield "\n".join(buf)
+    elif path.suffix == ".csv":
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            try:
+                headers = next(reader)
+            except StopIteration:
+                return  # empty file
+
+            buf = []
+            for row in reader:
+                if not row or all(v == "" for v in row):
+                    continue
+                row_text = ", ".join(
+                    f"{h}: {v}" for h, v in zip(headers, row) if v != ""
+                )
+                buf.append(row_text)
+                if len("\n".join(buf)) > 2000:
+                    yield "\n".join(buf)
+                    buf = []
+            if buf:
+                yield "\n".join(buf)
     else:
         raise ValueError(f"Unsupported file type: {path.suffix}")
 

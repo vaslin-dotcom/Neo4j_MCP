@@ -10,6 +10,7 @@ load_dotenv()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = "nvidia/nemotron-3-nano-30b-a3b"   # verify exact slug on build.nvidia.com
+NVIDIA_EMBEDDING_MODEL="nvidia/nv-embed-v1"
 
 # groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
