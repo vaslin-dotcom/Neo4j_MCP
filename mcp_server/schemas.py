@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 
 class Entity(BaseModel):
     name: str = Field(description="The entity's name, exactly as it appears in the text")
-    type: str = Field(description="The entity's category, e.g. Person, Organization, Location, Committee, Year")
+    type: str = Field(description="The entity's category, e.g. Person, Organization, Location, Committee")
     description: str = Field(default="", description="A brief description of this entity")
 
 
