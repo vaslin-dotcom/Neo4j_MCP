@@ -2,7 +2,6 @@ import os
 import time
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from openai import RateLimitError, InternalServerError, NotFoundError, APITimeoutError
 
 load_dotenv()
 
@@ -10,7 +9,7 @@ load_dotenv()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = "nvidia/nemotron-3-nano-30b-a3b"   # verify exact slug on build.nvidia.com
-NVIDIA_EMBEDDING_MODEL="nvidia/nv-embed-v1"
+NVIDIA_EMBEDDING_MODEL = "nvidia/nv-embed-v1"
 
 # groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -43,7 +42,7 @@ class SmartLLM:
     def __init__(self, primary, fallback):
         self.primary = primary
         self.fallback = fallback
-        self.last_model_used = None   # so sampling_callback can report the true source
+        self.last_model_used = None
 
     def bind_tools(self, tools):
         return SmartLLM(
@@ -58,7 +57,11 @@ class SmartLLM:
             print(f"[NVIDIA succeeded in {time.time()-start:.2f}s]")
             self.last_model_used = NVIDIA_MODEL
             return result
-        except (RateLimitError, InternalServerError, NotFoundError, APITimeoutError) as e:
+        except Exception as e:
+            # Broadened on purpose: with_structured_output(...).invoke(...) can raise
+            # pydantic.ValidationError, JSONDecodeError, BadRequestError, etc - not just
+            # the OpenAI transport errors. Any of these should fall back, not crash the
+            # calling chunk's task (which is what was producing exit code -1).
             elapsed = time.time() - start
             print(f"[NVIDIA failed after {elapsed:.2f}s: {type(e).__name__}] {e}")
             time.sleep(3)
@@ -76,11 +79,18 @@ class SmartLLM:
             raise
 
 
-def get_llm(output_schema=None):
+def get_llm(output_schema=None, max_tokens: int = 8000):
     time.sleep(1.5)
 
-    nvidia_llm = _build_llm(NVIDIA_MODEL, NVIDIA_API_KEY, NVIDIA_BASE_URL, disable_thinking=True)
-    groq_llm = _build_llm(GROQ_MODEL, GROQ_API_KEY, GROQ_BASE_URL)
+    # Give a little headroom over the caller's max_tokens for structured-output
+    # requests, since tool-call wrapping/formatting overhead eats into the budget
+    # a bit. Uncapped requests (no output_schema) use the caller's value directly.
+    effective_max_tokens = max_tokens
+
+    nvidia_llm = _build_llm(NVIDIA_MODEL, NVIDIA_API_KEY, NVIDIA_BASE_URL,
+                             max_tokens=effective_max_tokens, disable_thinking=True)
+    groq_llm = _build_llm(GROQ_MODEL, GROQ_API_KEY, GROQ_BASE_URL,
+                           max_tokens=effective_max_tokens)
 
     if output_schema:
         primary_final = nvidia_llm.with_structured_output(output_schema)

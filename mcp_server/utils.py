@@ -44,6 +44,14 @@ class Neo4jSetup:
             print(f"Neo4j connection failed: {e}", file=sys.stderr)
             raise
 
+    def close(self):
+        """Close the driver and free its connection pool. Call this when
+        the server shuts down or the script exits."""
+        if self.driver is not None:
+            self.driver.close()
+            self.driver = None
+            print("Neo4j connection closed.", file=sys.stderr)
+
     def setup_constraints(self):
         with self.driver.session() as session:
             session.run("""
@@ -71,7 +79,7 @@ class Neo4jSetup:
             for e in entities
         ]
 
-        # NEW: embed all entity names in ONE batch call
+        # Embed all entity names in ONE batch call
         if norm_entities:
             names = [e["name"] for e in norm_entities]
             embeddings = embed_texts(names)
@@ -94,15 +102,27 @@ class Neo4jSetup:
 
         with self.driver.session() as session:
             if norm_entities:
-                session.execute_write(self._merge_entities, norm_entities)
-                entities_written = len(norm_entities)
+                try:
+                    session.execute_write(self._merge_entities, norm_entities)
+                    entities_written = len(norm_entities)
+                except Exception as e:
+                    print(f"[neo4j] failed to write entities: {e}", file=sys.stderr)
+                    # Entities failed to write - relationships referencing them
+                    # would just re-create bare nodes via MERGE anyway, but skip
+                    # the relationship step here since something is clearly wrong
+                    # with this batch (e.g. bad embedding shape, connection drop).
+                    return {
+                        "entities_written": 0,
+                        "relationships_written": 0,
+                        "relationships_skipped": len(norm_relationships),
+                    }
 
             by_type: dict[str, list[dict]] = {}
             for rel in norm_relationships:
                 rel_type = sanitize_relation_type(rel["relation"])
                 by_type.setdefault(rel_type, []).append(rel)
 
-            # NEW: embed all distinct relation types in ONE batch call
+            # Embed all distinct relation types in ONE batch call
             if by_type:
                 rel_type_names = list(by_type.keys())
                 rel_type_embeddings = embed_texts(rel_type_names)
@@ -127,11 +147,18 @@ class Neo4jSetup:
 
     @staticmethod
     def _merge_entities(tx, entities: list[dict]):
+        # Only overwrite an existing description when the incoming one is
+        # non-empty - an empty string from a later chunk should never wipe
+        # out a good description written by an earlier chunk.
         tx.run(
             """
             UNWIND $entities AS e
             MERGE (n:Entity {name: e.name, type: e.type})
-            SET n.description = coalesce(e.description, n.description, ''),
+            SET n.description = CASE
+                    WHEN e.description IS NOT NULL AND e.description <> ''
+                    THEN e.description
+                    ELSE coalesce(n.description, '')
+                END,
                 n.embedding = e.embedding
             """,
             entities=entities,
@@ -148,14 +175,14 @@ class Neo4jSetup:
     @staticmethod
     def _merge_relationships(tx, rel_type: str, rels: list[dict]):
         # rel_type is sanitized (alnum/underscore only) before reaching here — safe to interpolate.
-        # MERGE on both endpoints (dedup entities), but CREATE for the relationship
-        # itself — duplicate relationships between the same two entities are
-        # allowed, per design (entities must be unique, relationships need not be).
+        # MERGE on the relationship itself (not just the endpoints) so the same
+        # fact extracted multiple times - across chunks, or across separate runs -
+        # collapses into a single edge instead of piling up duplicates.
         query = f"""
             UNWIND $rels AS r
             MERGE (a:Entity {{name: r.source_name, type: r.source_type}})
             MERGE (b:Entity {{name: r.target_name, type: r.target_type}})
-            CREATE (a)-[rel:`{rel_type}`]->(b)
+            MERGE (a)-[rel:`{rel_type}`]->(b)
         """
         tx.run(query, rels=rels)
 

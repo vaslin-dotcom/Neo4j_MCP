@@ -1,11 +1,20 @@
 import asyncio
+import sys
+
 from mcp.client.stdio import stdio_client
 from mcp import ClientSession,StdioServerParameters
 from config import get_llm,uri,user_name,password
 import json
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
-from mcp.types import CreateMessageResult,TextContent,SamplingCapability, SamplingToolsCapability
+from mcp.types import CreateMessageResult, TextContent, SamplingCapability, SamplingToolsCapability, \
+    LoggingMessageNotificationParams
+
+
+async def logging_callback(params: LoggingMessageNotificationParams):
+    # params.level is like "info", "warning", "error", "debug"
+    # params.data is the actual message payload (string, in ctx.info(msg) case)
+    print(f"[server log:{params.level}] {params.data}")
 
 async def run_agent_loop(llm,session,messages):
     for loop in range(10):
@@ -29,6 +38,7 @@ async def sampling_callback(context, params):
         schema = params.tools[0].inputSchema
         structured_llm = get_llm(output_schema=schema)
         result = structured_llm.invoke(prompt_text)
+        print(f"[sampling_callback] result type={type(result)} value={result!r}", file=sys.stderr, flush=True)
         response_text = json.dumps(result)
     else:
         structured_llm = get_llm()
@@ -57,17 +67,18 @@ async def main():
                 read, write,
                 sampling_callback=sampling_callback,
                 sampling_capabilities=SamplingCapability(tools=SamplingToolsCapability()),
+                logging_callback=logging_callback,
         ) as session:
             await session.initialize()
-
-            tools=await load_mcp_tools(session)
+            #await session.set_logging_level("info")
+            tools = await load_mcp_tools(session)
             llm = get_llm().bind_tools(tools)
 
-            file=r"D:\data\GOT.pdf"
+            file=r"D:\manual\1. EMD Dicer User - Manual_compressed.pdf"
 
             messages=[
                 SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),
-                HumanMessage(content=f"What are the entities and relationships in {file}"),
+                HumanMessage(content=f"create a graph db with entities and relationships from the file {file}"),
             ]
             summary_response=await run_agent_loop(llm,session,messages)
 
