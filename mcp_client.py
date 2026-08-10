@@ -74,7 +74,7 @@ async def main():
             tools = await load_mcp_tools(session)
             llm = get_llm().bind_tools(tools)
 
-            file=r"D:\manual\1. EMD Dicer User - Manual_compressed.pdf"
+            file=r"D:\data\GOT.pdf"
 
             messages=[
                 SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),

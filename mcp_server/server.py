@@ -13,23 +13,30 @@ EXTRACTION_TOOL_NAME = "return_extraction"
 
 
 @mcp.tool()
-async def extract_and_store_entities(file_path: str, ctx: Context) -> str:
+async def extract_and_store_entities(
+    file_path: str,
+    ctx: Context,
+    max_concurrency: int = 15,
+) -> str:
     """Extract named entities and relationships from a PDF/DOCX file and
     write them into Neo4j.
 
     The file is first split into chunks so the total count is known up
-    front. Each chunk is then processed through the connected client's
-    LLM (via MCP sampling) and its extracted entities/relationships are
-    written into the graph immediately - so partial progress is never
-    lost even if a later chunk fails or the run is interrupted.
+    front. Chunks are then processed concurrently (up to `max_concurrency`
+    at a time) - each chunk goes through LLM sampling and its results are
+    written to the graph as soon as that chunk finishes, so partial
+    progress is never lost and chunks don't block each other waiting on
+    the LLM or the DB.
     """
     import asyncio
 
-    # Step 1: materialize chunks up front so we know the total count
     chunks = list(chunk_document_streaming(file_path))
     total_chunks = len(chunks)
 
-    await ctx.info(f"Split '{file_path}' into {total_chunks} chunks. Starting extraction.")
+    await ctx.info(
+        f"Split '{file_path}' into {total_chunks} chunks. "
+        f"Starting extraction with up to {max_concurrency} chunks in parallel."
+    )
 
     extraction_tool = Tool(
         name=EXTRACTION_TOOL_NAME,
@@ -37,82 +44,95 @@ async def extract_and_store_entities(file_path: str, ctx: Context) -> str:
         inputSchema=ExtractionResult.model_json_schema(),
     )
 
+    semaphore = asyncio.Semaphore(max_concurrency)
+    stats_lock = asyncio.Lock()
+
+    # Dedicated counter: how many chunks have finished (success or fail),
+    # regardless of order. This is what drives progress notifications.
+    chunks_completed = 0
+
     failed_chunks = 0
     entities_written_total = 0
     relationships_written_total = 0
     relationships_skipped_total = 0
 
-    for i, chunk in enumerate(chunks):
-        prompt = EXTRACTION_PROMPT.format(chunk=chunk)
-        chunk_entities: list[Entity] = []
-        chunk_relationships: list[Relationship] = []
+    async def process_chunk(i: int, chunk: str) -> None:
+        nonlocal chunks_completed, failed_chunks
+        nonlocal entities_written_total, relationships_written_total, relationships_skipped_total
 
-        try:
-            result = await ctx.session.create_message(
-                messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
-                max_tokens=8000,
-                tools=[extraction_tool],
-                tool_choice=ToolChoice(mode="required"),
-            )
-            tool_call_content = result.content
-            if not isinstance(tool_call_content, list):
-                tool_call_content = [tool_call_content]
+        async with semaphore:
+            prompt = EXTRACTION_PROMPT.format(chunk=chunk)
+            chunk_entities: list[Entity] = []
+            chunk_relationships: list[Relationship] = []
+            chunk_failed = False
 
-            for block in tool_call_content:
-                if block.type == "text":
-                    try:
-                        data = json.loads(block.text)
-                        extraction = ExtractionResult.model_validate(data)
+            try:
+                result = await ctx.session.create_message(
+                    messages=[SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+                    max_tokens=8000,
+                    tools=[extraction_tool],
+                    tool_choice=ToolChoice(mode="required"),
+                )
+                tool_call_content = result.content
+                if not isinstance(tool_call_content, list):
+                    tool_call_content = [tool_call_content]
+
+                for block in tool_call_content:
+                    if block.type == "text":
+                        try:
+                            data = json.loads(block.text)
+                            extraction = ExtractionResult.model_validate(data)
+                            chunk_entities.extend(extraction.entities)
+                            chunk_relationships.extend(extraction.relationships)
+                        except Exception as parse_err:
+                            chunk_failed = True
+                            print(f"[chunk {i}] parse failed: {parse_err}", file=sys.stderr)
+                    elif block.type == "tool_use":
+                        extraction = ExtractionResult.model_validate(block.input)
                         chunk_entities.extend(extraction.entities)
                         chunk_relationships.extend(extraction.relationships)
-                    except Exception as parse_err:
-                        failed_chunks += 1
-                        print(f"[chunk {i}] parse failed: {parse_err}", file=sys.stderr)
-                        continue
-                elif block.type == "tool_use":
-                    extraction = ExtractionResult.model_validate(block.input)
-                    chunk_entities.extend(extraction.entities)
-                    chunk_relationships.extend(extraction.relationships)
-        except Exception as e:
-            failed_chunks += 1
-            print(f"[chunk {i}] failed: {e}", file=sys.stderr)
-            await ctx.info(f"Chunk {i + 1}/{total_chunks} failed extraction: {e}")
-            await ctx.report_progress(progress=i + 1, total=total_chunks)
-            continue
+            except Exception as e:
+                chunk_failed = True
+                print(f"[chunk {i}] extraction failed: {e}", file=sys.stderr)
 
-        # Step 2: write THIS chunk's entities/relationships immediately.
-        # Wrapped in try/except so one bad chunk's DB write doesn't kill
-        # extraction of the remaining chunks.
-        if chunk_entities or chunk_relationships:
-            try:
-                entities_payload = [e.model_dump() for e in chunk_entities]
-                relationships_payload = [r.model_dump() for r in chunk_relationships]
+            write_stats = {"entities_written": 0, "relationships_written": 0, "relationships_skipped": 0}
+            if not chunk_failed and (chunk_entities or chunk_relationships):
+                try:
+                    entities_payload = [e.model_dump() for e in chunk_entities]
+                    relationships_payload = [r.model_dump() for r in chunk_relationships]
+                    write_stats = await asyncio.to_thread(
+                        neo4j_instance.write_graph, entities_payload, relationships_payload
+                    )
+                except Exception as write_err:
+                    chunk_failed = True
+                    print(f"[chunk {i}] write failed: {write_err}", file=sys.stderr)
 
-                # write_graph does blocking Neo4j + embedding calls - run off
-                # the event loop so progress notifications keep streaming smoothly.
-                write_stats = await asyncio.to_thread(
-                    neo4j_instance.write_graph, entities_payload, relationships_payload
-                )
-
+            # Increment the shared counter and emit progress under the lock,
+            # so concurrent chunks never interleave their updates or logs.
+            async with stats_lock:
+                chunks_completed += 1
+                if chunk_failed:
+                    failed_chunks += 1
                 entities_written_total += write_stats["entities_written"]
                 relationships_written_total += write_stats["relationships_written"]
                 relationships_skipped_total += write_stats["relationships_skipped"]
 
-                await ctx.info(
-                    f"Chunk {i + 1}/{total_chunks} written: "
-                    f"+{write_stats['entities_written']} entities, "
-                    f"+{write_stats['relationships_written']} relationships "
-                    f"(running total: {entities_written_total} entities, "
-                    f"{relationships_written_total} relationships)"
-                )
-            except Exception as write_err:
-                failed_chunks += 1
-                print(f"[chunk {i}] write failed: {write_err}", file=sys.stderr)
-                await ctx.info(f"Chunk {i + 1}/{total_chunks} write failed: {write_err}")
-        else:
-            await ctx.info(f"Chunk {i + 1}/{total_chunks}: nothing extracted.")
+                if chunk_failed:
+                    await ctx.info(f"[{chunks_completed}/{total_chunks} done] Chunk {i + 1} failed.")
+                elif write_stats["entities_written"] or write_stats["relationships_written"]:
+                    await ctx.info(
+                        f"[{chunks_completed}/{total_chunks} done] Chunk {i + 1} written: "
+                        f"+{write_stats['entities_written']} entities, "
+                        f"+{write_stats['relationships_written']} relationships "
+                        f"(running total: {entities_written_total} entities, "
+                        f"{relationships_written_total} relationships)"
+                    )
+                else:
+                    await ctx.info(f"[{chunks_completed}/{total_chunks} done] Chunk {i + 1}: nothing extracted.")
 
-        await ctx.report_progress(progress=i + 1, total=total_chunks)
+                await ctx.report_progress(progress=chunks_completed, total=total_chunks)
+
+    await asyncio.gather(*(process_chunk(i, chunk) for i, chunk in enumerate(chunks)))
 
     if total_chunks > 0 and failed_chunks == total_chunks:
         return json.dumps({"error": f"All {total_chunks} chunks failed extraction. Check server logs for details."})
@@ -133,6 +153,8 @@ async def extract_and_store_entities(file_path: str, ctx: Context) -> str:
     )
 
     return json.dumps(output)
+
+
 @mcp.tool()
 def get_entity_context(entity_query: str, relation_query: str = None) -> str:
     """Look up an entity in the graph and return its connections.
