@@ -1,0 +1,11 @@
+mcp
+neo4j
+python-dotenv
+langchain-text-splitters
+sentence-transformers
+pypdf
+python-docx
+openpyxl
+pydantic
+groq
+openai

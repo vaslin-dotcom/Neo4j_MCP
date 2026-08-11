@@ -74,11 +74,11 @@ async def main():
             tools = await load_mcp_tools(session)
             llm = get_llm().bind_tools(tools)
 
-            file=r"D:\data\GOT.pdf"
+            file="GOT.pdf"
 
             messages=[
-                SystemMessage(content="You are a helpful assistant that summarizes documents concisely."),
-                HumanMessage(content=f"create a graph db with entities and relationships from the file {file}"),
+                SystemMessage(content="You are a helpful assistant who has access to graph db."),
+                HumanMessage(content=f"create graph db on file {file}"),
             ]
             summary_response=await run_agent_loop(llm,session,messages)
 

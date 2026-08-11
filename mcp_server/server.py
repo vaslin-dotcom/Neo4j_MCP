@@ -156,20 +156,49 @@ async def extract_and_store_entities(
 
 
 @mcp.tool()
-def get_entity_context(entity_query: str, relation_query: str = None) -> str:
-    """Look up an entity in the graph and return its connections.
+def get_entity_context(
+    entity_query: str,
+    relation_query: str = None,
+    target_entity_query: str = None,
+) -> str:
+    """Look up an entity in the graph and return information to answer the user's question.
 
-    Uses semantic (embedding-based) matching, so exact spelling isn't
-    required - e.g. "curie" will match "Marie Curie".
+    Uses semantic (embedding-based) matching throughout, so exact spelling
+    isn't required - e.g. "curie" will match "Marie Curie".
+
+    Call this with exactly one of the following patterns, based on what the
+    user's question actually contains:
+
+    1. Question mentions ONE entity, no specific relationship
+       ("Who is Marie Curie?", "Tell me about the committee"):
+       -> pass entity_query only. relation_query and target_entity_query
+          stay None. Returns ALL of that entity's connections - summarize
+          them into a natural-language answer.
+
+    2. Question mentions ONE entity AND a specific relationship
+       ("Who did Marie Curie work with?", "What is Marie Curie married to?"):
+       -> pass entity_query AND relation_query. target_entity_query stays None.
+          Returns only connections matching that relationship.
+
+    3. Question mentions TWO entities and asks how they relate
+       ("How is Marie Curie connected to Pierre Curie?",
+        "What's the relationship between the committee and the university?"):
+       -> pass entity_query AND target_entity_query. Optionally add
+          relation_query too if the question also names a specific relationship
+          ("Did Marie Curie work with Pierre Curie?"). Returns only the
+          relationship(s) directly between those two entities.
 
     Args:
-        entity_query: The entity to look up, as mentioned in the user's question.
+        entity_query: The primary entity to look up, as mentioned in the user's question.
         relation_query: Optional - a relationship word/phrase from the question
             (e.g. "married", "works with"). Matched semantically against
             relationship types actually stored in the graph, so exact
             wording isn't required.
+        target_entity_query: Optional - a second entity from the question, when
+            the user is asking specifically how two named entities relate to
+            each other rather than asking for one entity's full context.
     """
-    result = neo4j_instance.get_entity_context(entity_query, relation_query)
+    result = neo4j_instance.get_entity_context(entity_query, relation_query, target_entity_query)
     return json.dumps(result)
 
 

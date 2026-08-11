@@ -186,40 +186,105 @@ class Neo4jSetup:
         """
         tx.run(query, rels=rels)
 
-    def get_entity_context(self, entity_query: str, relation_query: str = None, limit: int = 20) -> dict:
+    def _resolve_entity(self, session, entity_query: str):
+        """Vector-search a fuzzy entity mention to a real (name, type, description) node."""
+        embedding = embed_texts([entity_query])[0]
+        match = session.run("""
+            CALL db.index.vector.queryNodes('entity_embeddings', 1, $embedding)
+            YIELD node, score
+            RETURN node.name AS name, node.type AS type,
+                   node.description AS description, score
+        """, embedding=embedding).single()
+        if match is None or match["score"] < 0.3:
+            return None
+        return match
+
+    def _resolve_relation(self, session, relation_query: str):
+        """Vector-search a fuzzy relationship phrase to a real relationship type."""
+        embedding = embed_texts([relation_query])[0]
+        match = session.run("""
+            CALL db.index.vector.queryNodes('relation_type_embeddings', 1, $embedding)
+            YIELD node, score
+            RETURN node.name AS name, score
+        """, embedding=embedding).single()
+        if match is None or match["score"] < 0.3:
+            return None
+        return match["name"]
+
+    def get_entity_context(
+        self,
+        entity_query: str,
+        relation_query: str = None,
+        target_entity_query: str = None,
+        limit: int = 20,
+    ) -> dict:
         if self.driver is None:
             self.connect()
 
-        entity_embedding = embed_texts([entity_query])[0]
-
         with self.driver.session() as session:
-            # Step 1: vector search to resolve the fuzzy entity query to a real node
-            match = session.run("""
-                CALL db.index.vector.queryNodes('entity_embeddings', 1, $embedding)
-                YIELD node, score
-                RETURN node.name AS name, node.type AS type,
-                       node.description AS description, score
-            """, embedding=entity_embedding).single()
+            # Step 1: resolve the primary entity
+            match = self._resolve_entity(session, entity_query)
             print(f"[get_entity_context] query={entity_query!r} match={match}", file=sys.stderr)
-            if match is None or match["score"] < 0.3:
+            if match is None:
                 return {"found": False, "query": entity_query}
 
             resolved_name = match["name"]
             resolved_type = match["type"]
 
-            # Step 2: if a relation was given, resolve it too via vector search
+            # Step 2: resolve the relation phrase, if given
             relation_filter = None
             if relation_query:
-                rel_embedding = embed_texts([relation_query])[0]
-                rel_match = session.run("""
-                    CALL db.index.vector.queryNodes('relation_type_embeddings', 1, $embedding)
-                    YIELD node, score
-                    RETURN node.name AS name, score
-                """, embedding=rel_embedding).single()
-                if rel_match and rel_match["score"] >= 0.3:
-                    relation_filter = rel_match["name"]
+                relation_filter = self._resolve_relation(session, relation_query)
 
-            # Step 3: fetch connections, filtered by resolved relation if one was found
+            # Step 3a: TWO-ENTITY mode - relationship(s) between two specific entities
+            if target_entity_query:
+                target_match = self._resolve_entity(session, target_entity_query)
+                print(f"[get_entity_context] target_query={target_entity_query!r} match={target_match}", file=sys.stderr)
+                if target_match is None:
+                    return {
+                        "found": False,
+                        "query": entity_query,
+                        "target_query": target_entity_query,
+                        "reason": "target entity not found in graph",
+                    }
+
+                target_name = target_match["name"]
+                target_type = target_match["type"]
+
+                if relation_filter:
+                    rel_result = session.run(f"""
+                        MATCH (a:Entity {{name: $a_name, type: $a_type}})
+                              -[r:`{relation_filter}`]-
+                              (b:Entity {{name: $b_name, type: $b_type}})
+                        RETURN type(r) AS relation
+                        LIMIT $limit
+                    """, a_name=resolved_name, a_type=resolved_type,
+                         b_name=target_name, b_type=target_type, limit=limit)
+                else:
+                    rel_result = session.run("""
+                        MATCH (a:Entity {name: $a_name, type: $a_type})
+                              -[r]-
+                              (b:Entity {name: $b_name, type: $b_type})
+                        RETURN type(r) AS relation
+                        LIMIT $limit
+                    """, a_name=resolved_name, a_type=resolved_type,
+                         b_name=target_name, b_type=target_type, limit=limit)
+
+                relations = [r["relation"] for r in rel_result]
+
+                return {
+                    "found": len(relations) > 0,
+                    "entity_name": resolved_name,
+                    "entity_type": resolved_type,
+                    "entity_description": match["description"],
+                    "target_entity_name": target_name,
+                    "target_entity_type": target_type,
+                    "target_entity_description": target_match["description"],
+                    "resolved_relation": relation_filter,
+                    "relations": relations,
+                }
+
+            # Step 3b: SINGLE-ENTITY mode - all connections, optionally filtered by relation
             if relation_filter:
                 conn_result = session.run(f"""
                     MATCH (e:Entity {{name: $name, type: $type}})-[r:`{relation_filter}`]-(other:Entity)
